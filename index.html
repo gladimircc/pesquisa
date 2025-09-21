@@ -1,42 +1,323 @@
-<!DOCTYPE html>
-<html lang="pt-br">
-<head>
-  <meta charset="UTF-8" />
-  <title>Contador do botão - ESP32</title>
-  <style>
-    body {
-      font-family: monospace;
-      background-color: #000;
-      color: #33ff33;
-      text-align: center;
-      padding-top: 50px;
-    }
-    h1 {
-      color: #66ff66;
-    }
-    #contador {
-      font-size: 3em;
-    }
-  </style>
-</head>
-<body>
-  <h1>Contador de Cliques do ESP32</h1>
-  <p>O botão foi pressionado:</p>
-  <div id="contador">--</div>
-  <p>vezes.</p>
+#include <WiFi.h>
+#include <PubSubClient.h>
 
-  <script>
-async function atualizarContador() {
-  try {
-    const response = await fetch("/contador?" + new Date().getTime());
-    const valor = await response.text();
-    document.getElementById("contador").textContent = valor;
-  } catch (e) {
-    document.getElementById("contador").textContent = "Erro";
+#define LED    8
+#define BOTAO  4
+#define WDT_TIMEOUT 30000  
+#define MAX_WIFI_ATTEMPTS 10
+#define MAX_MQTT_ATTEMPTS 5
+
+const char* ssid = "catarino";
+const char* senha = "g109visitante";
+const char* servidorMqtt = "test.mosquitto.org";
+const int portaMqtt = 1883;
+const char* topicoMqtt = "esp32/status/unisenac"; 
+const char* topicoBatimentoMqtt = "esp32/heartbeat/unisenac";
+
+WiFiClient clienteEsp;
+PubSubClient cliente(clienteEsp);
+
+int estadoBotao = 0;
+int ultimoEstadoBotao = 0;
+unsigned long ultimoBatimento = 0;
+int contadorBatimentos = 0;
+bool wifiConectado = false;
+
+unsigned long ultimoWatchdog = 0;
+unsigned long ultimaAtividade = 0;
+unsigned long ultimoDebugMemoria = 0;
+int tentativasWifi = 0;
+int tentativasMqtt = 0;
+bool sistemaEstavel = true;
+
+const unsigned long INTERVALO_BATIMENTO = 15000; 
+const unsigned long INTERVALO_DEBUG = 60000;     
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000); // Aguardar estabilização
+  Serial.println("\n========================================");
+  Serial.println("UniSENAC - ESP32C3 IoT Monitor v2.0");
+  Serial.println("Sistema Anti-Travamento Ativo");
+  Serial.println("========================================");
+  
+  pinMode(LED, OUTPUT);
+  pinMode(BOTAO, INPUT_PULLUP);
+  digitalWrite(LED, LOW);
+  
+  // Piscar LED para indicar inicialização
+  for(int i = 0; i < 3; i++) {
+    digitalWrite(LED, HIGH);
+    delay(200);
+    digitalWrite(LED, LOW);
+    delay(200);
+  }
+  
+  ultimoBatimento = millis();
+  ultimoWatchdog = millis();
+  ultimaAtividade = millis();
+  ultimoDebugMemoria = millis();
+  
+  Serial.println("Memória livre: " + String(ESP.getFreeHeap()) + " bytes");
+  Serial.println("Tamanho total: " + String(ESP.getHeapSize()) + " bytes");
+  
+  configurarWifi();
+  cliente.setServer(servidorMqtt, portaMqtt);
+  
+  Serial.println("✓ Sistema pronto e estável!");
+}
+
+void loop() {
+  unsigned long agora = millis();
+  ultimaAtividade = agora; 
+  if (agora - ultimoWatchdog > WDT_TIMEOUT) {
+    Serial.println("WATCHDOG: Sistema travado detectado!");
+    Serial.println("Reiniciando ESP32...");
+    delay(1000);
+    ESP.restart();
+  }
+  
+  if (agora - ultimoDebugMemoria > INTERVALO_DEBUG) {
+    debugSistema();
+    ultimoDebugMemoria = agora;
+  }
+  
+  if (WiFi.status() != WL_CONNECTED) {
+    if (wifiConectado) {
+      Serial.println("WiFi desconectado!");
+      wifiConectado = false;
+      tentativasWifi = 0;
+    }
+    
+    digitalWrite(LED, LOW);
+    
+    if (tentativasWifi < MAX_WIFI_ATTEMPTS) {
+      tentativasWifi++;
+      Serial.println("Tentativa WiFi #" + String(tentativasWifi));
+      configurarWifi();
+    } else {
+      Serial.println("Muitas falhas WiFi - reiniciando...");
+      delay(1000);
+      ESP.restart();
+    }
+  } else if (!wifiConectado) {
+    wifiConectado = true;
+    tentativasWifi = 0; 
+    Serial.println("WiFi reconectado!");
+  }
+
+  if (!cliente.connected()) {
+    if (tentativasMqtt < MAX_MQTT_ATTEMPTS) {
+      reconectar();
+      tentativasMqtt++;
+    } else {
+      Serial.println("Muitas falhas MQTT - reiniciando...");
+      delay(1000);
+      ESP.restart();
+    }
+  } else {
+    tentativasMqtt = 0; 
+    
+    if (!cliente.loop()) {
+      Serial.println("Falha no loop MQTT");
+      cliente.disconnect();
+    }
+    
+    if (agora - ultimoBatimento > INTERVALO_BATIMENTO) {
+      if (enviarBatimento()) {
+        ultimoBatimento = agora;
+        ultimoWatchdog = agora; 
+      } else {
+        Serial.println("Falha no heartbeat");
+      }
+    }
+  }
+
+  int leituraBotao = digitalRead(BOTAO);
+  if (leituraBotao != ultimoEstadoBotao) {
+    delay(50); 
+    leituraBotao = digitalRead(BOTAO); 
+    
+    if (leituraBotao != ultimoEstadoBotao) {
+      estadoBotao = leituraBotao;
+      ultimoEstadoBotao = leituraBotao;
+      
+      if (estadoBotao == LOW) {
+        Serial.println("Botão LOW");
+        digitalWrite(LED, HIGH);
+        if (!enviarStatusBotao(1)) {
+          Serial.println("Falha ao enviar status botão");
+        }
+      } else {
+        Serial.println("Botão HIGH");
+        digitalWrite(LED, LOW);
+        if (!enviarStatusBotao(0)) {
+          Serial.println("Falha ao enviar status botão");
+        }
+      }
+      ultimoWatchdog = agora;
+    }
+  }
+  
+  delay(10);
+}
+
+void debugSistema() {
+  Serial.println("========== DEBUG SISTEMA ==========");
+  Serial.println("Uptime: " + String(millis() / 1000) + "s");
+  Serial.println("Memória livre: " + String(ESP.getFreeHeap()) + " bytes");
+  Serial.println("Uso memória: " + String(((ESP.getHeapSize() - ESP.getFreeHeap()) * 100) / ESP.getHeapSize()) + "%");
+  Serial.println("WiFi RSSI: " + String(WiFi.RSSI()) + " dBm");
+  Serial.println("MQTT conectado: " + String(cliente.connected() ? "SIM" : "NÃO"));
+  Serial.println("Heartbeats enviados: " + String(contadorBatimentos));
+  Serial.println("Estado atual botão: " + String(estadoBotao == LOW ? "PRESSIONADO" : "LIBERADO"));
+  Serial.println("===================================");
+  
+  if (ESP.getFreeHeap() < 50000) {
+    Serial.println("Memória baixa!");
+    sistemaEstavel = false;
+  }
+  
+  if (WiFi.RSSI() < -80) {
+    Serial.println("Sinal Wi-Fi fraco!");
   }
 }
-    atualizarContador();
-    setInterval(atualizarContador, 3000);
-  </script>
-</body>
-</html>
+
+bool enviarStatusBotao(int botaoPressionado) {
+  if (!cliente.connected()) {
+    Serial.println("MQTT desconectado - não foi possível enviar status");
+    return false;
+  }
+  
+  if (ESP.getFreeHeap() < 10000) {
+    Serial.println("Memória insuficiente para enviar mensagem");
+    return false;
+  }
+  
+  String mensagemStatus = "{";
+  mensagemStatus += "\"type\":\"status\",";
+  mensagemStatus += "\"button\":" + String(botaoPressionado) + ",";
+  mensagemStatus += "\"rssi\":" + String(WiFi.RSSI()) + ",";
+  mensagemStatus += "\"voltage\":" + String(lerVoltagem(), 2) + ",";
+  mensagemStatus += "\"free_memory\":" + String(ESP.getFreeHeap()) + ",";
+  mensagemStatus += "\"total_memory\":" + String(ESP.getHeapSize()) + ",";
+  mensagemStatus += "\"ip\":\"" + WiFi.localIP().toString() + "\",";
+  mensagemStatus += "\"uptime\":" + String(millis() / 1000);
+  mensagemStatus += "}";
+  
+  return publicarMensagem(topicoMqtt, mensagemStatus.c_str());
+}
+
+bool publicarMensagem(const char* topico, const char* mensagem) {
+  if (cliente.connected()) {
+    if (cliente.publish(topico, mensagem)) {
+      Serial.println("Publicado: " + String(mensagem));
+      return true;
+    } else {
+      Serial.println("Falha ao publicar");
+      return false;
+    }
+  }
+  return false;
+}
+
+bool enviarBatimento() {
+  if (!cliente.connected()) {
+    Serial.println("MQTT desconectado - não foi possível enviar heartbeat");
+    return false;
+  }
+  
+  if (ESP.getFreeHeap() < 10000) {
+    Serial.println("Memória insuficiente para enviar heartbeat");
+    return false;
+  }
+  
+  contadorBatimentos++;
+  
+  String mensagemBatimento = "{";
+  mensagemBatimento += "\"type\":\"heartbeat\",";
+  mensagemBatimento += "\"counter\":" + String(contadorBatimentos) + ",";
+  mensagemBatimento += "\"rssi\":" + String(WiFi.RSSI()) + ",";
+  mensagemBatimento += "\"voltage\":" + String(lerVoltagem(), 2) + ",";
+  mensagemBatimento += "\"free_memory\":" + String(ESP.getFreeHeap()) + ",";
+  mensagemBatimento += "\"total_memory\":" + String(ESP.getHeapSize()) + ",";
+  mensagemBatimento += "\"ip\":\"" + WiFi.localIP().toString() + "\",";
+  mensagemBatimento += "\"uptime\":" + String(millis() / 1000);
+  mensagemBatimento += "}";
+  
+  if (publicarMensagem(topicoBatimentoMqtt, mensagemBatimento.c_str())) {
+    // Piscar LED para indicar heartbeat
+    int estadoOriginal = digitalRead(LED);
+    digitalWrite(LED, HIGH);
+    delay(50); 
+    digitalWrite(LED, estadoOriginal);
+    Serial.println("Heartbeat #" + String(contadorBatimentos) + " enviado");
+    return true;
+  } else {
+    contadorBatimentos--; // Reverter contador se falhou
+    Serial.println("Falha ao enviar heartbeat");
+    return false;
+  }
+}
+
+// Leitura de tensão
+float lerVoltagem() {
+  return 3.3; // Valor fixo - ajustar conforme necessário
+}
+
+// Conectar WiFi
+void configurarWifi() {
+  Serial.print("Conectando Wi-Fi: ");
+  Serial.println(ssid);
+  
+  WiFi.begin(ssid, senha);
+  unsigned long tempoInicio = millis();
+  
+  while (WiFi.status() != WL_CONNECTED && millis() - tempoInicio < 20000) {
+    delay(500);
+    Serial.print(".");
+    digitalWrite(LED, !digitalRead(LED)); // Piscar LED
+  }
+
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("\nFalha na conexão WiFi!");
+    digitalWrite(LED, LOW);
+  } else {
+    Serial.println("\nWi-Fi conectado!");
+    Serial.println("IP: " + WiFi.localIP().toString());
+    wifiConectado = true;
+    digitalWrite(LED, HIGH);
+  }
+}
+
+void reconectar() {
+  static unsigned long ultimaTentativa = 0;
+  static int contadorTentativas = 0;
+  
+  if (millis() - ultimaTentativa < 5000) return;
+  
+  ultimaTentativa = millis();
+  contadorTentativas++;
+  
+  Serial.print("MQTT tentativa #" + String(contadorTentativas) + "...");
+  
+  String idCliente = "ESP32C3-UniSENAC-" + String(random(0xffff), HEX);
+  
+  if (cliente.connect(idCliente.c_str())) {
+    Serial.println("Conectado!");
+    contadorTentativas = 0;
+    
+    enviarStatusBotao(digitalRead(BOTAO) == LOW ? 1 : 0);
+    enviarBatimento();
+    
+    Serial.println("ESP32C3 operacional!");
+  } else {
+    Serial.println("Falha: " + String(cliente.state()));
+    
+    if (contadorTentativas > MAX_MQTT_ATTEMPTS) {
+      Serial.println("Muitas falhas MQTT - reiniciando sistema...");
+      delay(1000);
+      ESP.restart();
+    }
+  }
+}
